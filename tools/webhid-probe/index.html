@@ -1,0 +1,149 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>VGN 电量探测 v2</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 24px 28px; background: #18191d; color: #eef1f7;
+         font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.hint { color: #98a0af; font-size: 13px; margin: 0 0 16px; line-height: 1.7; }
+  button { background: #2f6df6; color: #fff; border: 0; border-radius: 8px;
+           padding: 9px 16px; font-size: 14px; cursor: pointer; margin-right: 8px; }
+  #battery { font-size: 46px; font-weight: 700; color: #58c482; margin: 14px 0 4px; }
+  #battery small { font-size: 15px; color: #98a0af; font-weight: 400; }
+  pre { background: #20222a; border: 1px solid #363942; border-radius: 10px;
+        padding: 14px; font-family: Consolas, monospace; font-size: 12px; line-height: 1.6;
+        white-space: pre-wrap; word-break: break-all; max-height: 52vh; overflow: auto; }
+  .hit { color: #ffd166; font-weight: 700; }
+  #status { font-size: 13px; color: #98a0af; margin: 8px 0 12px; }
+</style>
+</head>
+<body>
+  <h1>VGN 外设电量探测 v2</h1>
+  <p class="hint">
+    页面会自动使用浏览器已授权的 HID 设备（不用再选）。它按 VGN 网页版的协议封装发
+    <b>0x87 电量查询</b>，校验和/总长各试几种组合。<b>期望电量 = 76 = 0x4c</b>，命中会高亮。
+  </p>
+  <button id="pick">手动选择设备</button>
+  <button id="run">重新探测</button>
+  <div id="status">准备中…</div>
+  <div id="battery"></div>
+  <pre id="log"></pre>
+
+<script>
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const batteryEl = document.getElementById('battery');
+const lines = [];
+
+function log(message) {
+  lines.push(message);
+  logEl.textContent = lines.join('\n');
+  post(message);
+}
+
+function post(message) { fetch('/log', { method: 'POST', body: message }).catch(() => {}); }
+
+function hex(bytes) {
+  return Array.from(bytes).map((b) => (b === 0x4c ? '[4c]' : b.toString(16).padStart(2, '0'))).join(' ');
+}
+
+// 63-byte packet: [0]=cmd [1]=param [2]=marker [3]=totalLen [4]=packetIndex [5]=payloadLen [6..61]=payload [62]=crc
+function buildPacket(cmd, options) {
+  const packet = new Uint8Array(63);
+  packet[0] = cmd;
+  packet[1] = 0x00;
+  packet[2] = options.marker;
+  packet[3] = options.totalLength;
+  packet[4] = 0;
+  packet[5] = 0;
+  // The dongle corrects the checksum to 255 - ((reportId + sum) % 256); use exactly that.
+  let sum = options.reportId;
+  for (let i = 0; i < 62; i++) sum += packet[i];
+  packet[62] = (255 - (sum % 256)) & 0xff;
+  return packet;
+}
+
+const replies = [];
+function attach(device) {
+  device.addEventListener('inputreport', (event) => {
+    const bytes = new Uint8Array(event.data.buffer);
+    const text = 'IN  reportId=' + event.reportId + ' len=' + bytes.length + ' : ' + hex(bytes);
+    replies.push({ reportId: event.reportId, bytes, text });
+    log(text);
+    post(text);
+    const hit = bytes.indexOf(0x4c);
+    if (hit >= 0 && bytes[0] === 0x87) {
+      batteryEl.innerHTML = '找到 0x4c <small>（下标 ' + hit + '）—— 电量 76%</small>';
+    }
+  });
+}
+
+async function probe(device) {
+  if (!device.opened) await device.open();
+  attach(device);
+  log('=== ' + device.productName + ' PID 0x' + device.productId.toString(16));
+  post('=== ' + device.productName + ' PID 0x' + device.productId.toString(16));
+
+  let reportId = null;
+  for (const collection of device.collections) {
+    log('collection up=0x' + collection.usagePage.toString(16) + ' u=0x' + collection.usage.toString(16) +
+        ' out=' + JSON.stringify(collection.outputReports.map((r) => r.reportId)) +
+        ' in=' + JSON.stringify(collection.inputReports.map((r) => r.reportId)));
+    if (collection.usagePage === 0xff60 && collection.outputReports.length) {
+      reportId = collection.outputReports[0].reportId;
+    }
+  }
+
+  if (reportId === null) {
+    statusEl.textContent = '这个设备没有 0xFF60 输出报告';
+    return;
+  }
+
+  const variants = [];
+  for (const totalLength of [0, 63, 1, 6]) {
+    for (const marker of [0x00]) {
+      variants.push({ label: 'total=' + totalLength + ' m=' + marker,
+                      packet: buildPacket(0x87, { totalLength, marker, reportId }) });
+    }
+  }
+
+  for (const variant of variants) {
+    try {
+      await device.sendReport(reportId, variant.packet);
+      log('OUT 0x87 ' + variant.label + ' -> ok (crc=' + variant.packet[62].toString(16) + ')');
+    } catch (e) {
+      log('OUT 0x87 ' + variant.label + ' -> ' + e.name);
+      continue;
+    }
+    await new Promise((r) => setTimeout(r, 260));
+  }
+
+  await new Promise((r) => setTimeout(r, 600));
+  const hits = replies.filter((r) => r.bytes[0] === 0x87);
+  statusEl.textContent = '探测完成：收到 ' + hits.length + ' 个 0x87 回包（总回包 ' + replies.length + '）';
+  log('--- done, 0x87 replies: ' + hits.length + ' ---');
+  post('--- done ---');
+}
+
+async function autoStart() {
+  statusEl.textContent = '查找已授权设备…';
+  const devices = await navigator.hid.getDevices();
+  const targets = devices.filter((d) => d.vendorId === 0x391d);
+  log('已授权设备数=' + devices.length + '，其中 VGN=' + targets.length);
+  if (!targets.length) { statusEl.textContent = '没有已授权的 VGN 设备，请点「手动选择设备」'; return; }
+  for (const device of targets) await probe(device);
+}
+
+document.getElementById('pick').onclick = async () => {
+  const devices = await navigator.hid.requestDevice({ filters: [{ vendorId: 0x391d }] });
+  for (const device of devices) await probe(device);
+};
+document.getElementById('run').onclick = () => autoStart();
+
+autoStart().catch((e) => { statusEl.textContent = '出错: ' + e.message; log('出错: ' + e.message); });
+</script>
+</body>
+</html>
